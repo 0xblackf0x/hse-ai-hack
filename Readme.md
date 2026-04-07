@@ -223,6 +223,9 @@
 > [!WARNING]
 > Jupyter Notebook с решением второго таска лежит [тут](notebooks/Task2.ipynb).
 
+> [!NOTE]
+> Ноутбуки с Colab почему-то не отображатся нормально на гитхабе. Можно скачать через Raw и открыть в IDE (тестил в VSCode).
+
 > [!WARNING]
 > CSV-файл со сгенерированными данными находится [тут](data/adversarial_prompts_nlpaug.csv).
 
