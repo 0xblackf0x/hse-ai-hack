@@ -254,14 +254,15 @@
 1. Загрузка модели и пайплайна fill‑mask
 
 ```python
+# Определяем устройство для вычислений: CUDA (GPU) если доступен, иначе CPU
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# Создаём пайплайн для задачи fill‑mask (заполнение пропусков)
 generator = pipeline(
-    "fill-mask",
-    model="DeepPavlov/rubert-base-cased",
-    device=0 if torch.cuda.is_available() else -1
+    "fill-mask",                                 # тип задачи
+    model="DeepPavlov/rubert-base-cased",        # предобученная русскоязычная модель BERT
+    device=0 if torch.cuda.is_available() else -1   # 0 = первый GPU, -1 = CPU
 )
-
 ```
 
 2. Функция рекурсивной аугментации smart_augment_ru(text, aug_p=0.2, max_generations=80, max_depth=5)
@@ -269,38 +270,63 @@ generator = pipeline(
 ```python
 def smart_augment_ru(text, aug_p=0.2, max_generations=80, max_depth=5):
     """
-    Рекурсивная аугментация
+    Рекурсивная аугментация текста через замену слов с помощью [MASK].
+    text: исходная строка
+    aug_p: доля слов, которые будут заменены (вероятность/интенсивность)
+    max_generations: максимальное количество уникальных вариаций
+    max_depth: максимальная глубина рекурсии (количество последовательных замен)
     """
+    # Множество для хранения уникальных вариантов (изначально – исходный текст)
     all_variants = set([text])
+    # Очередь для BFS: каждый элемент = (текст, глубина)
     queue = deque([(text, 0)])
 
+    # Пока не набрали нужное количество вариаций и очередь не пуста
     while len(all_variants) < max_generations and queue:
+        # Извлекаем текущий текст и его глубину из начала очереди
         current_text, depth = queue.popleft()
 
+        # Если достигнута максимальная глубина – не обрабатываем дальше
         if depth >= max_depth:
             continue
 
+        # Разбиваем текст на слова
         words = current_text.split()
+        # Сколько слов будем заменять (минимум 1)
         n_changes = max(1, int(len(words) * aug_p))
 
+        # Делаем 5 попыток генерации из одного current_text
         for _ in range(5):
+            # Копируем список слов, чтобы не менять оригинал
             new_words = words.copy()
+            # Выполняем n_changes замен
             for _ in range(n_changes):
+                # Случайный индекс слова для замены
                 idx = random.randint(0, len(words)-1)
+                # Создаём строку с [MASK] на месте выбранного слова
                 mask_text = ' '.join(words[:idx] + ['[MASK]'] + words[idx+1:])
                 try:
+                    # Получаем топ-15 предсказаний модели для маски
                     predictions = generator(mask_text, top_k=15)
                     if predictions:
+                        # Случайно выбираем одно из первых пяти предсказаний (для разнообразия)
                         new_word = predictions[random.randint(0, 4)]['token_str']
+                        # Заменяем слово в копии
                         new_words[idx] = new_word
                 except:
+                    # Если произошла ошибка (например, токенизация), пропускаем эту замену
                     continue
 
+            # Склеиваем изменённые слова обратно в строку
             new_variant = ' '.join(new_words)
+            # Если такой вариант ещё не встречался
             if new_variant not in all_variants:
+                # Добавляем в множество уникальных вариантов
                 all_variants.add(new_variant)
+                # Помещаем в очередь для дальнейшей рекурсии (глубина +1)
                 queue.append((new_variant, depth + 1))
 
+    # Возвращаем список уникальных вариаций, обрезанный до max_generations
     return list(all_variants)[:max_generations]
 
 ```
@@ -308,10 +334,15 @@ def smart_augment_ru(text, aug_p=0.2, max_generations=80, max_depth=5):
 3. Генерация для всех 10 базовых промптов
 
 ```python
-   all_variants = []
-   for prompt in seed_prompts:
-       variants = smart_augment_ru(prompt, aug_p=0.15, max_generations=80, max_depth=5)
-       all_variants.extend(variants[1:])
+# Список для сбора всех сгенерированных вариаций
+all_variants = []
+
+# Перебираем каждый исходный промпт из списка seed_prompts
+for prompt in seed_prompts:
+    # Генерируем до 80 вариаций для данного промпта (глубина 5, aug_p=0.15)
+    variants = smart_augment_ru(prompt, aug_p=0.15, max_generations=80, max_depth=5)
+    # Добавляем все варианты, кроме самого исходного (первого в списке)
+    all_variants.extend(variants[1:])
 
 ```
 
@@ -319,19 +350,23 @@ def smart_augment_ru(text, aug_p=0.2, max_generations=80, max_depth=5):
 
 ```python
 def is_textually_similar(a, b, threshold=0.85):
-    """Сравнение строк на основе совпадения символов"""
+    """Сравнение строк на основе совпадения символов (не семантическое)."""
+    # SequenceMatcher считает коэффициент схожести двух строк (0..1)
+    # Возвращаем True, если схожесть выше порога
     return SequenceMatcher(None, a, b).ratio() > threshold
 
 # Удаляем точные дубликаты
+# Множество автоматически убирает одинаковые строки
 unique = list(set(all_variants))
 
 # Удаляем текстуально похожие (порог 0.85)
-filtered = []
-for p in unique:
+filtered = []   # список для прошедших фильтрацию
+for p in unique:                     # для каждого уникального варианта
+    # Проверяем, не слишком ли он похож на уже отобранные
     if not any(is_textually_similar(p, q) for q in filtered):
-        filtered.append(p)
+        filtered.append(p)           # если нет – добавляем
 
-# Берём первые 200 (или меньше)
+# Берём первые 200 (или меньше, если не набралось)
 final_prompts = filtered[:200] if len(filtered) >= 200 else filtered
 
 ```
@@ -340,27 +375,45 @@ final_prompts = filtered[:200] if len(filtered) >= 200 else filtered
 
 ```python
 def classify_complexity(text):
+    # Длина текста (количество символов)
     length = len(text)
+    
+    # Количество «необычных» символов: цифры и знаки пунктуации из заданного набора
     unusual_chars = sum(1 for c in text if c.isdigit() or c in '!?@#$%^&*()')
+    
+    # Штраф за повторяющиеся подряд символы (например, "ааа" или "!!!")
     repeat_penalty = sum(1 for i in range(len(text)-1) if text[i] == text[i+1])
+    
+    # Итоговая оценка сложности: длина вносит вклад /100,
+    # каждый необычный символ +0.5, каждый повтор +0.3
     score = length/100 + unusual_chars*0.5 + repeat_penalty*0.3
+    
+    # Классификация по порогам
     if score < 3:
-        return "simple"
+        return "simple"      # простые запросы
     elif score < 7:
-        return "medium"
+        return "medium"      # средние
     else:
-        return "hard"
+        return "hard"        # сложные
 
 ```
 
 6. Сохранение в CSV (prompt, complexity, length)
 
 ```python
+# Создаём DataFrame pandas с тремя колонками:
+# - prompt: текст запроса
+# - complexity: уровень сложности (simple/medium/hard)
+# - length: длина запроса в символах
 df = pd.DataFrame({
     "prompt": final_prompts,
-    "complexity": complexities,
+    "complexity": complexities,   # complexities – список, полученный применением classify_complexity к каждому промпту
     "length": [len(p) for p in final_prompts]
 })
+
+# Сохраняем DataFrame в CSV-файл
+# index=False – не записывать номера строк
+# encoding="utf-8" – поддержка кириллицы
 df.to_csv("adversarial_prompts_nlpaug.csv", index=False, encoding="utf-8")
 
 ```
@@ -371,7 +424,7 @@ df.to_csv("adversarial_prompts_nlpaug.csv", index=False, encoding="utf-8")
 |----------|----------------|
 | **Уникальность (точные дубликаты)** | Все сгенерированные строки сохраняются в `set()`, что автоматически исключает идентичные варианты. После сбора всех вариаций выполняется явное преобразование списка во множество. |
 | **Текстуальная близость (почти дубликаты)** | Применяется `difflib.SequenceMatcher` с порогом `ratio > 0.85`. Если новый вариант слишком похож на уже принятый (например, отличается лишь одним пробелом или синонимом с высокой символьной перекрываемостью), он отбрасывается. |
-| **Разнообразие (лексическое и синтаксическое)** | 1. Случайный выбор позиций для замены. \n2. Использование топ‑15 предсказаний модели и случайный выбор одного из пяти первых – это даёт не единственный, а вариативный синоним. 3. Рекурсивный BFS‑обход с глубиной до 5 позволяет комбинировать несколько замен в одном предложении, создавая цепочечные модификации. 4. Ограничение `max_generations=80` на исходный промпт гарантирует, что от каждого базового запроса будет получено достаточное (но не чрезмерное) число разнообразных формулировок. |
+| **Разнообразие (лексическое и синтаксическое)** | 1. Случайный выбор позиций для замены. 2. Использование топ‑15 предсказаний модели и случайный выбор одного из пяти первых – это даёт не единственный, а вариативный синоним. 3. Рекурсивный BFS‑обход с глубиной до 5 позволяет комбинировать несколько замен в одном предложении, создавая цепочечные модификации. 4. Ограничение `max_generations=80` на исходный промпт гарантирует, что от каждого базового запроса будет получено достаточное (но не чрезмерное) число разнообразных формулировок. |
 | **Релевантность (сохранение смысла запроса)** | Поскольку заменяются только отдельные слова на предсказанные моделью в контексте маски, общая семантика и интенция запроса остаются неизменными. Модель `rubert-base-cased` обучена на корпусе русского языка и даёт контекстно уместные токены (например, для фразы «цена билета» может предложить «стоимость билета», «цена пропуска» и т.п.). |
 
 В результате из 790 сгенерированных уникальных строк после фильтрации по текстуальной близости осталось 232, из которых отобрано 200 – таким образом, итоговая выборка не содержит дублирующихся или почти идентичных запросов.
